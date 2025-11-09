@@ -5,7 +5,6 @@ import pandas as pd
 
 app = FastAPI()
 
-# CORS: allow your GPT and tools to call this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,12 +23,6 @@ def home():
 
 @app.post("/trends")
 def get_trends(data: dict):
-    """
-    Single keyword mode.
-    Uses Google Trends normalization for this term only:
-    100 = this term's own peak in past 12 months.
-    Also returns monthly interest for this term alone.
-    """
     keyword = data.get("keyword")
     if not keyword:
         return {"error": "Keyword missing"}
@@ -45,15 +38,11 @@ def get_trends(data: dict):
             "related_queries_top_10": [],
         }
 
-    # Remove helper columns if present
-    value_series = interest[keyword]
+    values = interest[keyword]
+    peak = int(values.max())
 
-    # Peak over the 12m window
-    peak = int(value_series.max())
-
-    # Monthly averages (0-100, still within same normalization)
     monthly = (
-        value_series
+        values
         .resample("M")
         .mean()
         .round()
@@ -65,7 +54,6 @@ def get_trends(data: dict):
         for ts, val in monthly.items()
     ]
 
-    # Related queries
     related = pytrends.related_queries().get(keyword, {})
     top_related = related.get("top")
     queries = top_related["query"].head(10).tolist() if top_related is not None else []
@@ -80,30 +68,12 @@ def get_trends(data: dict):
 
 @app.post("/multi-trends")
 def get_multi_trends(data: dict):
-    """
-    Multi keyword comparison mode.
-
-    Input:
-      { "keywords": ["protein powder", "adjustable dumbbells", ...] }
-
-    Behavior:
-      - Queries all keywords TOGETHER in a single Google Trends payload.
-      - Google Trends normalization:
-          100 = highest interest point across ALL provided keywords
-                in the last 12 months worldwide.
-          Other values are relative to that.
-      - Returns for each keyword:
-          - peak_score_12m_worldwide (relative, correct)
-          - monthly_interest: list of {month: "YYYY-MM", score: int}
-          - top 10 related queries
-    """
     keywords = data.get("keywords")
     if not keywords or not isinstance(keywords, list):
         return {"error": "keywords must be a non-empty list"}
 
-    # Deduplicate + clean
     keywords = [k.strip() for k in keywords if isinstance(k, str) and k.strip()]
-    keywords = list(dict.fromkeys(keywords))  # keep order, remove dups
+    keywords = list(dict.fromkeys(keywords))
 
     if not keywords:
         return {"error": "keywords must be a non-empty list"}
@@ -114,5 +84,45 @@ def get_multi_trends(data: dict):
     if interest.empty:
         return {"results": []}
 
-    # Filter to value columns only (exclude isPartial)
-    value_cols
+    value_cols = [kw for kw in keywords if kw in interest.columns]
+    if not value_cols:
+        return {"results": []}
+
+    monthly_df = (
+        interest[value_cols]
+        .resample("M")
+        .mean()
+        .round()
+        .astype(int)
+    )
+
+    related_all = pytrends.related_queries()
+    results = []
+
+    for kw in value_cols:
+        series = interest[kw]
+        peak = int(series.max())
+
+        monthly_interest = [
+            {"month": ts.strftime("%Y-%m"), "score": int(val)}
+            for ts, val in monthly_df[kw].items()
+        ]
+
+        related = related_all.get(kw, {})
+        top_related = related.get("top")
+        queries = (
+            top_related["query"].head(10).tolist()
+            if top_related is not None
+            else []
+        )
+
+        results.append(
+            {
+                "keyword": kw,
+                "peak_score_12m_worldwide": peak,
+                "monthly_interest": monthly_interest,
+                "related_queries_top_10": queries,
+            }
+        )
+
+    return {"results": results}
